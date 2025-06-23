@@ -12,7 +12,6 @@ warnings.simplefilter(action='ignore', category=BiopythonDeprecationWarning)
 import json
 import logging
 import math
-import random
 import sys
 import time
 import zipfile
@@ -27,7 +26,6 @@ from io import StringIO
 
 import importlib_metadata
 import numpy as np
-import pandas
 
 try:
     import alphafold
@@ -62,11 +60,18 @@ from colabfold.utils import (
     NO_GPU_FOUND,
     CIF_REVISION_DATE,
     get_commit,
-    safe_filename,
     setup_logging,
     CFMMCIFIO,
+    AF3Utils,
+)
+from colabfold.input import (
+    pair_msa,
+    msa_to_str,
+    get_queries,
+    safe_filename
 )
 from colabfold.relax import relax_me
+from colabfold.alphafold import extra_ptm
 
 from Bio.PDB import MMCIFParser, PDBParser, MMCIF2Dict
 from Bio.PDB.PDBIO import Select
@@ -354,6 +359,8 @@ def predict_structure(
     save_pair_representations: bool = False,
     save_recycles: bool = False,
     keep_existing_results: bool = True,
+    calc_extra_ptm: bool = False,
+    use_probs_extra: bool = True,
 ):
     """Predicts structure using AlphaFold for the given sequence."""
     mean_scores = []
@@ -460,6 +467,14 @@ def predict_structure(
                 return_representations=return_representations,
                 callback=callback)
 
+            if calc_extra_ptm and 'predicted_aligned_error' in result.keys():
+                extra_ptm_output = extra_ptm.get_chain_and_interface_metrics(result, input_features['asym_id'],
+                    use_probs_extra=use_probs_extra,
+                    use_jnp=False)
+                result.pop('pae_matrix_with_logits', None)
+                result['actifptm'] = extra_ptm_output['actifptm']
+            else:
+                calc_extra_ptm = False
             prediction_times.append(time.time() - start)
 
             ########################
@@ -472,7 +487,7 @@ def predict_structure(
             if not is_complex: result.pop("iptm",None)
             print_line = ""
             conf.append({})
-            for x,y in [["mean_plddt","pLDDT"],["ptm","pTM"],["iptm","ipTM"]]:
+            for x,y in [["mean_plddt","pLDDT"],["ptm","pTM"],["iptm","ipTM"], ['actifptm', 'actifpTM']]:
               if x in result:
                 print_line += f" {y}={result[x]:.3g}"
                 conf[-1][x] = float(result[x])
@@ -516,9 +531,11 @@ def predict_structure(
                 plddt = result["plddt"][:seq_len]
                 scores = {"plddt": np.around(plddt.astype(float), 2).tolist()}
                 if "predicted_aligned_error" in result:
-                  pae   = result["predicted_aligned_error"][:seq_len,:seq_len]
+                  pae = result["predicted_aligned_error"][:seq_len,:seq_len]
                   scores.update({"max_pae": pae.max().astype(float).item(),
                                  "pae": np.around(pae.astype(float), 2).tolist()})
+                  if calc_extra_ptm:
+                    scores.update(extra_ptm_output)
                   for k in ["ptm","iptm"]:
                     if k in conf[-1]: scores[k] = np.around(conf[-1][k], 2).item()
                   del pae
@@ -577,179 +594,6 @@ def predict_structure(
     return {"rank":rank,
             "metric":metric,
             "result_files":result_files}
-
-def parse_fasta(fasta_string: str) -> Tuple[List[str], List[str]]:
-    """Parses FASTA string and returns list of strings with amino-acid sequences.
-
-    Arguments:
-      fasta_string: The string contents of a FASTA file.
-
-    Returns:
-      A tuple of two lists:
-      * A list of sequences.
-      * A list of sequence descriptions taken from the comment lines. In the
-        same order as the sequences.
-    """
-    sequences = []
-    descriptions = []
-    index = -1
-    for line in fasta_string.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
-            continue
-        if line.startswith(">"):
-            index += 1
-            descriptions.append(line[1:])  # Remove the '>' at the beginning.
-            sequences.append("")
-            continue
-        elif not line:
-            continue  # Skip blank lines.
-        sequences[index] += line
-
-    return sequences, descriptions
-
-def get_queries(
-    input_path: Union[str, Path], sort_queries_by: str = "length"
-) -> Tuple[List[Tuple[str, str, Optional[List[str]]]], bool]:
-    """Reads a directory of fasta files, a single fasta file or a csv file and returns a tuple
-    of job name, sequence and the optional a3m lines"""
-
-    input_path = Path(input_path)
-    if not input_path.exists():
-        raise OSError(f"{input_path} could not be found")
-
-    if input_path.is_file():
-        if input_path.suffix == ".csv" or input_path.suffix == ".tsv":
-            sep = "\t" if input_path.suffix == ".tsv" else ","
-            df = pandas.read_csv(input_path, sep=sep, dtype=str)
-            assert "id" in df.columns and "sequence" in df.columns
-            queries = [
-                (seq_id, sequence.upper().split(":"), None)
-                for seq_id, sequence in df[["id", "sequence"]].itertuples(index=False)
-            ]
-            for i in range(len(queries)):
-                if len(queries[i][1]) == 1:
-                    queries[i] = (queries[i][0], queries[i][1][0], None)
-        elif input_path.suffix == ".a3m":
-            (seqs, header) = parse_fasta(input_path.read_text())
-            if len(seqs) == 0:
-                raise ValueError(f"{input_path} is empty")
-            query_sequence = seqs[0]
-            # Use a list so we can easily extend this to multiple msas later
-            a3m_lines = [input_path.read_text()]
-            queries = [(input_path.stem, query_sequence, a3m_lines)]
-        elif input_path.suffix in [".fasta", ".faa", ".fa"]:
-            (sequences, headers) = parse_fasta(input_path.read_text())
-            queries = []
-            for sequence, header in zip(sequences, headers):
-                sequence = sequence.upper()
-                if sequence.count(":") == 0:
-                    # Single sequence
-                    queries.append((header, sequence, None))
-                else:
-                    # Complex mode
-                    queries.append((header, sequence.upper().split(":"), None))
-        else:
-            raise ValueError(f"Unknown file format {input_path.suffix}")
-    else:
-        assert input_path.is_dir(), "Expected either an input file or a input directory"
-        queries = []
-        for file in sorted(input_path.iterdir()):
-            if not file.is_file():
-                continue
-            if file.suffix.lower() not in [".a3m", ".fasta", ".faa"]:
-                logger.warning(f"non-fasta/a3m file in input directory: {file}")
-                continue
-            (seqs, header) = parse_fasta(file.read_text())
-            if len(seqs) == 0:
-                logger.error(f"{file} is empty")
-                continue
-            query_sequence = seqs[0]
-            if len(seqs) > 1 and file.suffix in [".fasta", ".faa", ".fa"]:
-                logger.warning(
-                    f"More than one sequence in {file}, ignoring all but the first sequence"
-                )
-
-            if file.suffix.lower() == ".a3m":
-                a3m_lines = [file.read_text()]
-                queries.append((file.stem, query_sequence.upper(), a3m_lines))
-            else:
-                if query_sequence.count(":") == 0:
-                    # Single sequence
-                    queries.append((file.stem, query_sequence, None))
-                else:
-                    # Complex mode
-                    queries.append((file.stem, query_sequence.upper().split(":"), None))
-
-    # sort by seq. len
-    if sort_queries_by == "length":
-        queries.sort(key=lambda t: len("".join(t[1])))
-
-    elif sort_queries_by == "random":
-        random.shuffle(queries)
-
-    is_complex = False
-    for job_number, (_, query_sequence, a3m_lines) in enumerate(queries):
-        if isinstance(query_sequence, list):
-            is_complex = True
-            break
-        if a3m_lines is not None and a3m_lines[0].startswith("#"):
-            a3m_line = a3m_lines[0].splitlines()[0]
-            tab_sep_entries = a3m_line[1:].split("\t")
-            if len(tab_sep_entries) == 2:
-                query_seq_len = tab_sep_entries[0].split(",")
-                query_seq_len = list(map(int, query_seq_len))
-                query_seqs_cardinality = tab_sep_entries[1].split(",")
-                query_seqs_cardinality = list(map(int, query_seqs_cardinality))
-                is_single_protein = (
-                    True
-                    if len(query_seq_len) == 1 and query_seqs_cardinality[0] == 1
-                    else False
-                )
-                if not is_single_protein:
-                    is_complex = True
-                    break
-    return queries, is_complex
-
-def pair_sequences(
-    a3m_lines: List[str], query_sequences: List[str], query_cardinality: List[int]
-) -> str:
-    a3m_line_paired = [""] * len(a3m_lines[0].splitlines())
-    for n, seq in enumerate(query_sequences):
-        lines = a3m_lines[n].splitlines()
-        for i, line in enumerate(lines):
-            if line.startswith(">"):
-                if n != 0:
-                    line = line.replace(">", "\t", 1)
-                a3m_line_paired[i] = a3m_line_paired[i] + line
-            else:
-                a3m_line_paired[i] = a3m_line_paired[i] + line * query_cardinality[n]
-    return "\n".join(a3m_line_paired)
-
-def pad_sequences(
-    a3m_lines: List[str], query_sequences: List[str], query_cardinality: List[int]
-) -> str:
-    _blank_seq = [
-        ("-" * len(seq))
-        for n, seq in enumerate(query_sequences)
-        for _ in range(query_cardinality[n])
-    ]
-    a3m_lines_combined = []
-    pos = 0
-    for n, seq in enumerate(query_sequences):
-        for j in range(0, query_cardinality[n]):
-            lines = a3m_lines[n].split("\n")
-            for a3m_line in lines:
-                if len(a3m_line) == 0:
-                    continue
-                if a3m_line.startswith(">"):
-                    a3m_lines_combined.append(a3m_line)
-                else:
-                    a3m_lines_combined.append(
-                        "".join(_blank_seq[:pos] + [a3m_line] + _blank_seq[pos + 1 :])
-                    )
-            pos += 1
-    return "\n".join(a3m_lines_combined)
 
 def get_msa_and_templates(
     jobname: str,
@@ -978,30 +822,6 @@ def process_multimer_features(
     np_example = pipeline_multimer.pad_msa(np_example, min_num_seq=min_num_seq)
     return np_example
 
-def pair_msa(
-    query_seqs_unique: List[str],
-    query_seqs_cardinality: List[int],
-    paired_msa: Optional[List[str]],
-    unpaired_msa: Optional[List[str]],
-) -> str:
-    if paired_msa is None and unpaired_msa is not None:
-        a3m_lines = pad_sequences(
-            unpaired_msa, query_seqs_unique, query_seqs_cardinality
-        )
-    elif paired_msa is not None and unpaired_msa is not None:
-        a3m_lines = (
-            pair_sequences(paired_msa, query_seqs_unique, query_seqs_cardinality)
-            + "\n"
-            + pad_sequences(unpaired_msa, query_seqs_unique, query_seqs_cardinality)
-        )
-    elif paired_msa is not None and unpaired_msa is None:
-        a3m_lines = pair_sequences(
-            paired_msa, query_seqs_unique, query_seqs_cardinality
-        )
-    else:
-        raise ValueError(f"Invalid pairing")
-    return a3m_lines
-
 def generate_input_feature(
     query_seqs_unique: List[str],
     query_seqs_cardinality: List[int],
@@ -1198,20 +1018,6 @@ def unserialize_msa(
         template_features,
     )
 
-def msa_to_str(
-    unpaired_msa: List[str],
-    paired_msa: List[str],
-    query_seqs_unique: List[str],
-    query_seqs_cardinality: List[int],
-) -> str:
-    msa = "#" + ",".join(map(str, map(len, query_seqs_unique))) + "\t"
-    msa += ",".join(map(str, query_seqs_cardinality)) + "\n"
-    # build msa with cardinality of 1, it makes it easier to parse and manipulate
-    query_seqs_cardinality = [1 for _ in query_seqs_cardinality]
-    msa += pair_msa(query_seqs_unique, query_seqs_cardinality, paired_msa, unpaired_msa)
-    return msa
-
-
 def put_mmciffiles_into_resultdir(
     pdb_hit_file: Path,
     local_pdb_path: Path,
@@ -1263,7 +1069,7 @@ def put_mmciffiles_into_resultdir(
 
 
 def run(
-    queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]]]],
+    queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]], Optional[List[Tuple[str, str,int]]]]],
     result_dir: Union[str, Path],
     num_models: int,
     is_complex: bool,
@@ -1307,6 +1113,8 @@ def run(
     local_pdb_path: Optional[Path] = None,
     use_cluster_profile: bool = True,
     feature_dict_callback: Callable[[Any], Any] = None,
+    calc_extra_ptm: bool = False,
+    use_probs_extra: bool = True,
     **kwargs
 ):
     # check what device is available
@@ -1367,10 +1175,15 @@ def run(
     if "ptm" not in model_type and "multimer" not in model_type:
         rank_by = "plddt"
 
+    # added for actifptm calculation
+    if not is_complex and calc_extra_ptm:
+        logger.info("Calculating extra pTM is not supported for single chain prediction, skipping it.")
+        calc_extra_ptm = False
+
     # get max length
     max_len = 0
     max_num = 0
-    for _, query_sequence, _ in queries:
+    for _, query_sequence, _, _ in queries:
         N = 1 if isinstance(query_sequence,str) else len(query_sequence)
         L = len("".join(query_sequence))
         if L > max_len: max_len = L
@@ -1435,6 +1248,8 @@ def run(
         "use_fuse": use_fuse,
         "use_bfloat16": use_bfloat16,
         "version": importlib_metadata.version("colabfold"),
+        "calc_extra_ptm": calc_extra_ptm,
+        "use_probs_extra": use_probs_extra,
     }
     config_out_file = result_dir.joinpath("config.json")
     config_out_file.write_text(json.dumps(config, indent=4))
@@ -1460,7 +1275,7 @@ def run(
     ranks, metrics = [],[]
     first_job = True
     job_number = 0
-    for job_number, (raw_jobname, query_sequence, a3m_lines) in enumerate(queries):
+    for job_number, (raw_jobname, query_sequence, a3m_lines, _) in enumerate(queries):
         if jobname_prefix is not None:
             # pad job number based on number of queries
             fill = len(str(len(queries)))
@@ -1612,6 +1427,7 @@ def run(
                         use_fuse=use_fuse,
                         use_bfloat16=use_bfloat16,
                         save_all=save_all,
+                        calc_extra_ptm=calc_extra_ptm
                     )
                     first_job = False
 
@@ -1640,7 +1456,10 @@ def run(
                     save_single_representations=save_single_representations,
                     save_pair_representations=save_pair_representations,
                     save_recycles=save_recycles,
+                    calc_extra_ptm=calc_extra_ptm,
+                    use_probs_extra=use_probs_extra,
                 )
+                
                 result_files += results["result_files"]
                 ranks.append(results["rank"])
                 metrics.append(results["metric"])
@@ -1676,6 +1495,11 @@ def run(
                 paes_plot.savefig(str(pae_png), bbox_inches='tight')
                 paes_plot.close()
                 result_files.append(pae_png)
+
+                # make pairwise interface metric plots and chainwise ptm plot
+                if calc_extra_ptm:
+                    ext_metric_png = result_dir.joinpath(f"{jobname}_ext_metrics.png")
+                    extra_ptm.plot_chain_pairwise_analysis(scores, fig_path=ext_metric_png)
 
             # make pLDDT plot
             plddt_plot = plot_plddts([np.asarray(x["plddt"]) for x in scores],
@@ -1718,6 +1542,64 @@ def set_model_type(is_complex: bool, model_type: str) -> str:
         else:
             model_type = "alphafold2_ptm"
     return model_type
+
+def generate_af3_input(
+    queries: List[Tuple[str, Union[str, List[str]], Optional[List[str]], Optional[List[Tuple[str, str, int]]]]],
+    result_dir: Union[str, Path],
+    msa_mode: str = "mmseqs2_uniref_env",
+    pair_mode: str = "unpaired_paired",
+    pairing_strategy: str = "greedy",
+    use_templates: bool = False,
+    custom_template_path: str = None,
+    jobname_prefix: Optional[str] = None,
+    host_url: str = DEFAULT_API_SERVER, #NOTE: what is this ?
+    user_agent: str = "", #NOTE: what is this ?
+    # is_complex: bool,
+    # model_type: str = "auto",
+):
+    result_dir = Path(result_dir) 
+    result_dir.mkdir(exist_ok=True)
+
+    job_number = 0
+
+    for job_number, (raw_jobname, query_sequences, a3m_lines, other_molecules) in enumerate(queries):
+        if jobname_prefix is not None:
+            # pad job number based on number of queries
+            fill = len(str(len(queries)))
+            jobname = safe_filename(jobname_prefix) + "_" + str(job_number).zfill(fill)
+            # job_number += 1 # Why add?
+        else:
+            jobname = safe_filename(raw_jobname)
+
+        ###########################################
+        # generate MSA (a3m_lines) and templates
+        ###########################################
+        try:
+            if a3m_lines is None:
+                (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features) \
+                = get_msa_and_templates(jobname, query_sequences, a3m_lines, result_dir, msa_mode, use_templates,
+                    custom_template_path, pair_mode, pairing_strategy, host_url, user_agent)
+
+            elif a3m_lines is not None:
+                (unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality, template_features) \
+                = unserialize_msa(a3m_lines, query_sequences)
+                # if use_templates:
+                #     (_, _, _, _, template_features) \
+                #         = get_msa_and_templates(jobname, query_seqs_unique, unpaired_msa, result_dir, 'single_sequence', use_templates,
+                #             custom_template_path, pair_mode, pairing_strategy, host_url, user_agent)
+
+            # save json
+            af3 = AF3Utils(jobname, query_seqs_unique, query_seqs_cardinality, unpaired_msa, paired_msa, other_molecules)
+            with open(result_dir.joinpath(f"{jobname}.json"), "w") as f:
+                f.write(json.dumps(af3.content, indent = 4))
+                
+            # save a3m
+            msa = msa_to_str(unpaired_msa, paired_msa, query_seqs_unique, query_seqs_cardinality)
+            result_dir.joinpath(f"{jobname}.a3m").write_text(msa)
+
+        except Exception as e:
+            logger.exception(f"Failed to generate AF3 input json for {jobname}: Could not get MSA/templates. {e}")
+            continue
 
 def main():
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
@@ -1891,6 +1773,18 @@ def main():
         action="store_true",
         help="Experimental: For multimer models, disable cluster profiles.",
     )
+    pred_group.add_argument(
+        "--calc-extra-ptm",
+        default=False,
+        action="store_true",
+        help="Experimental: calculate pairwise metrics (ipTM and actifpTM), and also chain-wise pTM",
+    )
+    pred_group.add_argument(
+        "--no-use-probs-extra",
+        default=False,
+        action="store_true",
+        help="Experimental: instead of contact probabilities form use binary contacts for extra metrics calculation",
+    )
     pred_group.add_argument("--data", help="Path to AlphaFold2 weights directory.")
 
     relax_group = parser.add_argument_group("Relaxation arguments", "")
@@ -2034,6 +1928,15 @@ def main():
         "Set to 0 to disable.",
     )
 
+    af3_group = parser.add_argument_group(
+        "AlphaFold3 arguments", ""
+    )
+    af3_group.add_argument(
+        "--af3-json",
+        help="Generate input JSON for AlphaFold3 from the provided FASTA/A3M file.",
+        action="store_true",
+    )
+    
     args = parser.parse_args()
 
     if (args.custom_template_path is not None) and (args.pdb_hit_file is not None):
@@ -2056,6 +1959,7 @@ def main():
     data_dir = Path(args.data or default_data_dir)
 
     queries, is_complex = get_queries(args.input, args.sort_queries_by)
+
     model_type = set_model_type(is_complex, args.model_type)
 
     if args.msa_only:
@@ -2077,8 +1981,27 @@ def main():
     if args.amber and args.num_relax == 0:
         args.num_relax = args.num_models * args.num_seeds
 
+    # added for actifptm calculation
+    use_probs_extra = False if args.no_use_probs_extra else True
+
     user_agent = f"colabfold/{version}"
 
+    if args.af3_json:
+        generate_af3_input(
+            queries=queries,
+            result_dir=args.results,
+            msa_mode=args.msa_mode,
+            pair_mode=args.pair_mode,
+            pairing_strategy=args.pair_strategy,
+            use_templates=args.templates,
+            custom_template_path=args.custom_template_path,
+            jobname_prefix=args.jobname_prefix,
+            host_url=args.host_url,
+            user_agent=user_agent,
+            # extra_molecules=extra_molecules,
+        )
+        return
+    
     run(
         queries=queries,
         result_dir=args.results,
@@ -2122,6 +2045,8 @@ def main():
         jobname_prefix=args.jobname_prefix,
         save_all=args.save_all,
         save_recycles=args.save_recycles,
+        calc_extra_ptm=args.calc_extra_ptm,
+        use_probs_extra=use_probs_extra,
     )
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ For details of what was changed in v1.5, see [change log](https://github.com/sok
 |                                                                                                                                                  |
 | **BETA (in development) notebooks**                                                                                                              |          |           |         |           |           |
 | [RoseTTAFold2](https://colab.research.google.com/github/sokrypton/ColabFold/blob/main/RoseTTAFold2.ipynb)                                        | Yes      | Yes       | Yes     | No        | WIP       |
+| [Boltz](https://colab.research.google.com/github/sokrypton/ColabFold/blob/main/Boltz1.ipynb)                                        | Yes      | Yes       | Yes     | No        | No       |
+| [BioEmu](https://colab.research.google.com/github/sokrypton/ColabFold/blob/main/BioEmu.ipynb)                                        | Yes      | No       | Yes     | No        | No       |
 | [OmegaFold](https://colab.research.google.com/github/sokrypton/ColabFold/blob/main/beta/omegafold.ipynb)                                         | Yes      | Maybe     | No      | No        | No        |
 | [AlphaFold2_advanced_v2](https://colab.research.google.com/github/sokrypton/ColabDesign/blob/gamma/af/examples/predict.ipynb) (new experimental notebook)                  | Yes      | Yes       | Yes     | No        | Yes       |
 
@@ -106,6 +108,98 @@ In some cases using precomputed database can still be useful. For the following 
 (2) Fast single query searches require the full index (the `.idx` files) to be kept in memory. This can be done with e.g. by using [vmtouch](https://github.com/hoytech/vmtouch). Thus, this type of search requires a machine with at least 768GB to 1TB RAM for the ColabfoldDB. If the index is present in memory, use the `--db-load-mode 2` parameter in `colabfold_search` to avoid index loading overhead.
 
 If no index was created (`MMSEQS_NO_INDEX=1` was set), then `--db-load-mode` does not do anything and can be ignored.
+
+### Saving MSAs in AlphaFold3-compatible JSON format
+You can export MSAs into a json format compatible with AlphaFold3 input using the `--af3-json` option. 
+
+**With colabfold_search:**
+
+If you are using the local database setup with colabfold_search, you can add the `--af3-json` option to save the MSAs as AlphaFold3 input json:
+```shell
+colabfold_search --mmseqs /path/to/bin/mmseqs input_sequences.fasta /path/to/db_folder msas --af3-json
+```
+This will create a json file in the `msas` folder, using the same name as the a3m file.
+
+**With colabfold_batch:**
+
+If you are using the MSA server via colabfold_batch, you can also use the `--af3-json` option. However, structure prediction will be skipped, and only the json file will be generated. 
+```shell
+colabfold_batch input_sequences.fasta out_dir --af3-json
+```
+
+#### Including non-protein molecules in FASTA
+AlphaFold3 supports non-protein components such as ligands and nucleic acids in input complexes. To include these in the generated json file, you can specify them directly in your FASTA input using the following format, `molecule type|sequence|(copies)`. As molecue types, dna, rna, ccd, smiles are allowed.
+
+ > :exclamation: **Substitute aromatic bonds in SMILES**
+ > If your SMILES string contains aromatic bonds (`:`), please replace them with semicolons (`;`) to avoid internal parsing issues.
+
+- Examples
+  - For DNA: `dna|ATCG`
+  - For RNA: `rna|AUGC`
+  - For ligands: 
+    - SMILES string: `smiles|C1=NC(=C2C(=N1)N(C=N2)[C@H]3[C@@H]([C@@H]([C@H](O3)COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N`
+    - CCD code: `ccd|ATP`
+  - To specify multiple copies of a molecule, you can add a number after the sequence, e.g. `ccd|ATP|2` or `dna|ATCG|2`.
+
+Here is an example of biological complex with 2 proteins and 2 ATP ligands:
+```
+>Complex1|Prot1:Prot2:Lig
+FIRSTPROTEIN:SECONDPROTEIN:ccd|ATP|2
+>Complex2|Prot1:Prot2:Lig
+FIRSTPROTEIN:SECONDPROTEIN:ccd|ATP:ccd|ATP
+```
+As the `copies` is optional, the `Complex1` and `Complex2` will result in identical json input.
+
+ Note that MMseqs2-based MSAs are only generated for the protein sequences. RNA entries will not have unpaired MSAs in the json file. However, the field is marked as null so that AlphaFold3 can generate MSAs for them. 
+
+### GPU-accelerated search with ⁠`colabfold_search` ⁠
+ColabFold supports GPU-accelerated MSA searches through [MMseqs2-GPU](https://www.biorxiv.org/content/10.1101/2024.11.13.623350v1).
+
+#### GPU database setup
+To setup the GPU databases, you will need to run the ⁠`setup_databases.sh`⁠ command with ⁠`GPU=1`⁠ as an environment variable:
+
+```
+GPU=1 ./setup_databases.sh /path/to/db_folder
+```
+
+This will download and setup the GPU databases in the specified folder. Note that here we do not pass ⁠`MMSEQS_NO_INDEX=1`⁠ as an argument since the indices are useful in the GPU search since we will keep them in the GPU memory.
+
+#### GPU search
+By default, running `colabfold_search` with the `--gpu 1` option uses all available GPUs for its search.
+
+```
+colabfold_search /path/to/bin/mmseqs input_sequences.fasta /path/to/db_folder msas --gpu 1 
+```
+
+To select specific GPUs, set the `CUDA_VISIBLE_DEVICES` environment variable:
+```
+CUDA_VISIBLE_DEVICES=0,1 colabfold_search --mmseqs /path/to/bin/mmseqs input_sequences.fasta /path/to/db_folder msas --gpu 1
+```
+
+#### Optional GPU server for enhanced performance:
+For frequent searches or to achieve minimal latency, you can run a dedicated GPU server. This server holds databases permanently in GPU memory, largely eliminating search overhead:
+
+Start the GPU server(s):
+```
+mmseqs gpuserver /path/to/db_folder/colabfold_envdb_202108_db --max-seqs 10000 --db-load-mode 0 --prefilter-mode 1 &
+PID1=$!
+mmseqs gpuserver /path/to/db_folder/uniref30_2302_db --max-seqs 10000 --db-load-mode 0 --prefilter-mode 1 &
+PID2=$!
+```
+
+By default, the GPU server distributes the database evenly across all visible GPUs. You can limit GPU usage by setting the CUDA_VISIBLE_DEVICES environment variable (e.g., `CUDA_VISIBLE_DEVICES=0,1`). 
+Important: Ensure that the `CUDA_VISIBLE_DEVICES` environment variable is set consistently for both `gpuserver` and `colabfold_search`, otherwise `colabfold_search` will try wait for the `gpuserver` to appear until a set timeout (by default 5 minutes). If your database exceeds GPU memory capacity, the GPU server efficiently streams data between host and GPU memory using asynchronous CUDA streams.
+
+Run searches using the GPU server:
+```
+colabfold_search /path/to/bin/mmseqs input_sequences.fasta /path/to/db_folder msas --gpu 1 --gpu-server 1
+```
+To stop the server(s) when done:
+```
+kill $PID1
+kill $PID2
+```
+For more details, see [GPU-accelerated search](https://github.com/soedinglab/MMseqs2/wiki#gpu-accelerated-search).
 
 ### Tutorials & Presentations
 - ColabFold Tutorial presented at the Boston Protein Design and Modeling Club. [[video]](https://www.youtube.com/watch?v=Rfw7thgGTwI) [[slides]](https://docs.google.com/presentation/d/1mnffk23ev2QMDzGZ5w1skXEadTe54l8-Uei6ACce8eI).

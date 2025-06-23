@@ -17,15 +17,15 @@ See https://github.com/google/jax/#pip-installation-gpu-cuda for more details.
 
 If you're sure you want to run without a GPU, pass `--cpu`"""
 
-DEFAULT_API_SERVER = "https://api.colabfold.com"
+DEFAULT_API_SERVER = "http://192.168.62.51:9091"
 
 ACCEPT_DEFAULT_TERMS = \
 """
-WARNING: You are welcome to use the default MSA server, however keep in mind that it's a
-limited shared resource only capable of processing a few thousand MSAs per day. Please
-submit jobs only from a single IP address. We reserve the right to limit access to the
-server case-by-case when usage exceeds fair use. If you require more MSAs: You can 
-precompute all MSAs with `colabfold_search` or host your own API and pass it to `--host-url`
+WARNING: You are using the internal CBCSRV MMseqs2 server, with a local ColabFold 1.5.5 installation.
+This server was last updated 22.10.2024. The databases or the ColabFold installation might be too old
+at the time of use. Please be aware, and consider getting a newer version by youself if that is the case!
+You can use the internal MMseqs2 server API by using http://192.168.62.51:9091 as the host url in the
+colabfold_batch script. If the server does not respond, ask around!
 """
 
 class TqdmHandler(logging.StreamHandler):

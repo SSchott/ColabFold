@@ -318,6 +318,13 @@ class file_manager:
         self.files[self.tag].append([x,ext,file])
         return file
 
+    def exists(self, x: str, ext:str) -> Path:
+        file = self.result_dir.joinpath(f"{self.prefix}_{x}_{self.tag}.{ext}")
+        if file.is_file():
+            return True
+        else:
+            return False
+
     def set_tag(self, tag):
         self.tag = tag
 
@@ -346,6 +353,7 @@ def predict_structure(
     save_single_representations: bool = False,
     save_pair_representations: bool = False,
     save_recycles: bool = False,
+    keep_existing_results: bool = True,
 ):
     """Predicts structure using AlphaFold for the given sequence."""
     mean_scores = []
@@ -419,6 +427,32 @@ def predict_structure(
 
             return_representations = save_all or save_single_representations or save_pair_representations
 
+            if keep_existing_results and files.exists("unrelaxed","pdb"):
+                logger.info(f"{tag} was found. Loading scores and skipping!")
+                if files.exists("scores","json"):
+                    with files.get("scores","json").open("r") as handle:
+                        _scores = json.load(handle)
+                        if is_complex:
+                            mean_scores.append(0.8 * _scores['iptm'] + 0.2 * _scores['ptm'])
+                        else:
+                            mean_scores.append(np.mean(_scores['plddt']))
+                        print_line = ""
+                        conf.append({})
+                        for x,y in [["plddt","pLDDT"],["ptm","pTM"],["iptm","ipTM"]]:
+                            if x in _scores:
+                                if x == "plddt":
+                                    print_line += f" {y}={np.mean(_scores[x]):.3g}"
+                                    _scores["mean_plddt"] = np.mean(_scores[x])
+                                    x = "mean_plddt"
+                                else:
+                                    print_line += f" {y}={_scores[x]:.3g}"
+                                conf[-1][x] = float(_scores[x])
+                        conf[-1]["print_line"] = print_line
+                    files.get("unrelaxed","pdb")
+                    continue
+                else:
+                    logger.error(f"Scores file for {tag} not found")
+                    
             # predict
             result, recycles = \
             model_runner.predict(input_features,
@@ -509,6 +543,9 @@ def predict_structure(
 
     rank, metric = [],[]
     result_files = []
+    if rank_by == "skip":
+        logger.info(f"Skipping ranking and exiting")
+        exit()
     logger.info(f"reranking models by '{rank_by}' metric")
     model_rank = np.array(mean_scores).argsort()[::-1]
     for n, key in enumerate(model_rank):
@@ -1911,7 +1948,7 @@ def main():
         help='Choose metric to rank the "--num-models" predicted models.',
         type=str,
         default="auto",
-        choices=["auto", "plddt", "ptm", "iptm", "multimer"],
+        choices=["auto", "plddt", "ptm", "iptm", "multimer", "skip"],
     )
     output_group.add_argument(
         "--stop-at-score",
@@ -2014,6 +2051,7 @@ def main():
         version += f" ({commit})"
 
     logger.info(f"Running colabfold {version}")
+    logger.info(f"Version modded by SSchott to use CBCSrv local MMSeqs2 and keep existing results!")
 
     data_dir = Path(args.data or default_data_dir)
 

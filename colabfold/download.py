@@ -9,7 +9,7 @@ import requests
 
 # The data dir location logic switches between a version with and one without "params" because alphafold
 # always internally joins "params". (We should probably patch alphafold)
-default_data_dir = Path(appdirs.user_cache_dir(__package__ or "colabfold"))
+default_data_dir = Path("/apps/local/cbclab/COLABFOLD/colabfold")
 
 def download(url, params_dir, size_queue, progress_queue):
     try:
